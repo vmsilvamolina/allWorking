@@ -199,27 +199,35 @@ jobs:
           ECS_TASK_FAMILY: web-app-${{ needs.build-and-push.outputs.environment }}
           CONTAINER_NAME: web-app-${{ needs.build-and-push.outputs.environment }}
         run: |
-          # Obtener la task definition actual y actualizar solo la imagen
+          # Get current task definition
           TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition "$ECS_TASK_FAMILY" \
             --query 'taskDefinition' \
             --output json)
 
-          # Inyectar nueva imagen en el container correcto
+          # Inject new image into the correct container
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
             --arg IMAGE "$IMAGE_URI" \
             --arg NAME "$CONTAINER_NAME" \
             '.containerDefinitions |= map(if .name == $NAME then .image = $IMAGE else . end)'
           )
 
-          # Registrar nueva revisión de task definition
+          # Register new task definition revision, dropping any null fields
           NEW_TASK_ARN=$(aws ecs register-task-definition \
             --family "$ECS_TASK_FAMILY" \
-            --cli-input-json "$(echo $NEW_TASK_DEF | jq '{containerDefinitions, networkMode, requiresCompatibilities, cpu, memory, executionRoleArn, taskRoleArn}')" \
+            --cli-input-json "$(echo $NEW_TASK_DEF | jq '{
+              containerDefinitions,
+              networkMode,
+              requiresCompatibilities,
+              cpu,
+              memory,
+              executionRoleArn,
+              taskRoleArn
+            } | with_entries(select(.value != null))')" \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
 
-          # Actualizar el servicio con la nueva task definition
+          # Update service with new task definition
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
@@ -227,7 +235,7 @@ jobs:
             --query 'service.serviceArn' \
             --output text
 
-          # Esperar a que el despliegue esté estable
+          # Wait for stable deployment
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE"
