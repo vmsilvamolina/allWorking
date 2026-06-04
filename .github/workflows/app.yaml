@@ -1,0 +1,227 @@
+name: App CI/CD
+
+on:
+  push:
+    branches: ["main", "staging", "dev"]
+    paths:
+      - 'app/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno a desplegar (dev/staging/prod)"
+        required: true
+        default: "dev"
+
+permissions:
+  contents: read
+  id-token: write  # Necesario para OIDC (recomendado sobre access keys)
+
+jobs:
+  # ──────────────────────────────────────────────
+  # JOB 1: Análisis estático de código (Semgrep)
+  # ──────────────────────────────────────────────
+  code-scan:
+    name: Code Scan (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config=auto \
+            --sarif \
+            --output=semgrep-results.sarif \
+            ./app
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep-results.sarif
+
+  # ──────────────────────────────────────────────
+  # JOB 2: Build y push a ECR
+  # ──────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: code-scan
+
+    env:
+      AWS_REGION: us-east-1
+
+    # Determinar entorno según rama o input manual
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      environment: ${{ steps.set-env.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determinar entorno
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_name }}" = "main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_name }}" = "staging" ]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag y push de imagen
+        id: build
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ENV: ${{ steps.set-env.outputs.environment }}
+          # El repo ECR incluye el entorno en el nombre para separar ambientes
+          ECR_REPO: web-app-${{ steps.set-env.outputs.environment }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$REGISTRY/$ECR_REPO:$IMAGE_TAG"
+
+          docker build \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.branch=${{ github.ref_name }}" \
+            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$REGISTRY/$ECR_REPO:$IMAGE_TAG" \
+            -t "$REGISTRY/$ECR_REPO:latest" \
+            ./app
+
+          docker push "$REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPO:latest"
+
+          # Exportar URI de imagen para el siguiente job
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────
+  # JOB 3: Scan de imagen con Trivy
+  # ──────────────────────────────────────────────
+  image-scan:
+    name: Image Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    env:
+      AWS_REGION: us-east-1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image_uri }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'  # Falla el pipeline si hay críticos/altos
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ──────────────────────────────────────────────
+  # JOB 4: Deploy en ECS
+  # ──────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [build-and-push, image-scan]
+
+    env:
+      AWS_REGION: us-east-1
+
+    environment:
+      name: ${{ needs.build-and-push.outputs.environment }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy nueva imagen en ECS
+        env:
+          ENV: ${{ needs.build-and-push.outputs.environment }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          ECS_CLUSTER: ecs-cluster-${{ needs.build-and-push.outputs.environment }}
+          ECS_SERVICE: web-app-${{ needs.build-and-push.outputs.environment }}
+          ECS_TASK_FAMILY: web-app-${{ needs.build-and-push.outputs.environment }}
+          CONTAINER_NAME: web-app-${{ needs.build-and-push.outputs.environment }}
+        run: |
+          # Obtener la task definition actual y actualizar solo la imagen
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_FAMILY" \
+            --query 'taskDefinition' \
+            --output json)
+
+          # Inyectar nueva imagen en el container correcto
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "$IMAGE_URI" \
+            --arg NAME "$CONTAINER_NAME" \
+            '.containerDefinitions |= map(if .name == $NAME then .image = $IMAGE else . end)'
+          )
+
+          # Registrar nueva revisión de task definition
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --family "$ECS_TASK_FAMILY" \
+            --cli-input-json "$(echo $NEW_TASK_DEF | jq '{containerDefinitions, networkMode, requiresCompatibilities, cpu, memory, executionRoleArn, taskRoleArn}')" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          # Actualizar el servicio con la nueva task definition
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TASK_ARN" \
+            --query 'service.serviceArn' \
+            --output text
+
+          # Esperar a que el despliegue esté estable
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
