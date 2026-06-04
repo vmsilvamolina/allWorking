@@ -4,12 +4,6 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
-variable "profile" {
-  description = "Nombre del perfil"
-  type        = string
-  default     = "default"
-}
-
 variable "environment" {
   description = "Ambiente de despliegue, por ejemplo: dev, staging, prod"
   type        = string
